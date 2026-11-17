@@ -1,0 +1,5 @@
+# Keep ModemManager off the second AT port of the Intel XMM7560 (Fibocom L860-GL)
+# so that ltentp can own it. Must sort before ModemManager's 80-mm-candidate.rules.
+# UNVERIFIED on hardware: check with `udevadm info /dev/wwan0at1` and `mmcli -m 0`
+# (the port should be listed as ignored).
+ACTION=="add|change|move|bind", SUBSYSTEM=="wwan", KERNEL=="wwan[0-9]*at1", ENV{ID_MM_PORT_IGNORE}="1"

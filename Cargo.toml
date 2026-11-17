@@ -1,0 +1,17 @@
+[package]
+name = "ltentp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "PoC: read LTE network time (NITZ) from a WWAN AT port, log it and feed it to chrony for evaluation"
+publish = false
+
+# Standard library only. Adding a dependency needs a reason in README.md.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
