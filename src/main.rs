@@ -2,18 +2,17 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::thread;
-use std::time::Duration;
 
 use ltentp::chrony::{ChronySocket, SampleSink};
 use ltentp::cli::{self, Command, Options};
 use ltentp::clock::SystemClock;
-use ltentp::recorder::{Recorder, run};
+use ltentp::edge::CclkPoller;
+use ltentp::recorder::Recorder;
+use ltentp::session::{Session, run};
 
 /// Enables `+CTZEU` (zone + UTC) reports. Sent on every start: the setting is
 /// not assumed to survive a modem reset or FCC unlock.
 const INIT_COMMAND: &[u8] = b"AT+CTZR=3\r";
-const CCLK_COMMAND: &[u8] = b"AT+CCLK?\r";
 
 fn main() -> ExitCode {
     let options = match cli::parse(std::env::args().skip(1)) {
@@ -67,22 +66,12 @@ fn start(o: &Options) -> io::Result<()> {
 
     port.write_all(INIT_COMMAND)?;
 
-    if let Some(interval) = o.cclk_interval {
-        let writer = port.try_clone()?;
-        thread::spawn(move || poll_cclk(writer, interval));
-    }
-
-    run(&mut port, &mut SystemClock::new(), &mut recorder)
-}
-
-fn poll_cclk(mut writer: File, interval: Duration) {
-    loop {
-        thread::sleep(interval);
-        if let Err(e) = writer.write_all(CCLK_COMMAND) {
-            eprintln!("ltentp: AT+CCLK? polling stopped: {e}");
-            return;
-        }
-    }
+    let reader = port.try_clone()?;
+    let poller = o
+        .cclk_interval
+        .map(|interval| CclkPoller::new(interval, o.cclk_step));
+    let mut session = Session::new(recorder, poller, port);
+    run(reader, SystemClock::new(), &mut session)
 }
 
 fn open_csv(path: &Path) -> io::Result<File> {

@@ -25,8 +25,8 @@ pub enum TimeLine {
     },
     /// `+CTZV: <tz>` — zone only (`AT+CTZR=1`).
     Ctzv { tz_quarters: i32 },
-    /// `+CCLK: "<time>[±zz]"` — the modem clock. `time` is the field as written,
-    /// with no zone applied: on the L860-GL it was observed to already be UTC.
+    /// `+CCLK: "<time>[±zz]"` — the modem clock. `time` is the field as written
+    /// (local time per TS 27.007); [`TimeLine::cclk_utc`] applies the zone.
     Cclk {
         time: DateTime,
         tz_quarters: Option<i32>,
@@ -42,6 +42,19 @@ impl TimeLine {
             Self::Ctze { .. } => "CTZE",
             Self::Ctzv { .. } => "CTZV",
             Self::Cclk { .. } => "CCLK",
+        }
+    }
+
+    /// For `+CCLK`, the clock as Unix seconds (UTC): the time field is local
+    /// time and the zone (quarter-hours, local − UTC) is subtracted, per TS 27.007.
+    /// Without a zone the field is taken as UTC. `None` for other lines.
+    #[must_use]
+    pub fn cclk_utc(&self) -> Option<i64> {
+        match *self {
+            Self::Cclk { time, tz_quarters } => {
+                Some(time.unix_seconds() - i64::from(tz_quarters.unwrap_or(0)) * 900)
+            }
+            _ => None,
         }
     }
 }
@@ -301,6 +314,19 @@ mod tests {
                 "not rejected: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn cclk_utc_subtracts_the_zone() {
+        // Observed on Linux 2026-11-18 at 01:10:19 UTC: the field was JST.
+        let t = ok(r#"+CCLK: "26/11/18,10:10:19+36""#);
+        assert_eq!(t.cclk_utc(), Some(1_794_964_219));
+        // West of UTC: local 01:01:01 at -2 h is 03:01:01 UTC.
+        let t = ok(r#"+CCLK: "01/01/01,01:01:01-08""#);
+        assert_eq!(t.cclk_utc(), Some(978_310_861 + 7_200));
+        let t = ok(r#"+CCLK: "01/01/01,01:01:01""#);
+        assert_eq!(t.cclk_utc(), Some(978_310_861));
+        assert_eq!(ok("+CTZV: +36").cclk_utc(), None);
     }
 
     #[test]
