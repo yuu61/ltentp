@@ -1,21 +1,20 @@
 # ltentp
 
-LTE 回線の網時刻 (NITZ) を、GNSS NTP のような時刻源として使えるかを評価するための PoC です。
+LTE のモジュールや LTE のやり取り (NITZ・SIB16 など網からの情報) から時刻を取り、GNSS NTP のような時刻源として使えるかを評価するための PoC です。LTE 回線の上で NTP を使うことは対象外です。
 WWAN モデムの AT ポートから時刻関連の通知を読み、受信した瞬間のシステム時刻と一緒に CSV に記録し、`+CTZEU` (UTC 付きの網時刻) を chrony の `refclock SOCK` に送ります。
 あわせて `AT+CCLK?` を短い間隔で問い合わせ、モデムの時計の秒が切り替わる瞬間を数 ms の幅で求めます (`CCLK_EDGE`)。
 
-評価機のシステム時刻は、chrony で有線 LAN の GNSS NTP (基準) に合わせておきます。NITZ と LTE 経由の NTP は `noselect` で観測するだけで、時計の調整には使いません。
+評価機のシステム時刻は、chrony で有線 LAN の NTP (基準) に合わせておきます。NITZ は `noselect` で観測するだけで、時計の調整には使いません。
 そのため CSV の `offset_s` は「NITZ − GNSS 基準」の近似になります。意味を持つのは、chrony が基準に同期している間 (`chronyc tracking` で確認) の値だけです。
 
 ## 状態
 
 - ハードウェアなしのテスト (ユニットテスト、FIFO と偽 chronyd を使う結合テスト) は通っています
-- 実機: ThinkPad P14s Gen 4 の Fibocom L860-GL (PCI `8086:7560`、Linux では `iosm` ドライバ)、Debian 13、IIJmio (KDDI 網)
+- 実機: ThinkPad P14s Gen 4 (21HF) の Fibocom L860-GL-16 (`AT+CGMM`、Intel XMM7560、PCI `8086:7560`、サブシステム `1cf8:8655`、ファームウェア 18601.5001.00.01.17.30)、Debian 13.7 (カーネル 6.12、`iosm` ドライバ)、IIJmio (KDDI 網)
 - 2026-11-18 に実機で確認したこと (`docs/at-commands.md`):
   - FCC unlock、網への登録、AT ポートからの読み取りと `AT+CTZR=3` は動きました
   - **`+CTZEU` は一度も届いていません** (初回の登録を含む)。chrony に NITZ を送る経路は実機では未検証です
   - `--cclk-interval` (`CCLK_EDGE`) は実機で動き、秒の切り替わりを ±6〜8 ms の幅で求められました。モデムの時計と UTC のずれは、登録の直後は −0.56 秒・−0.82 秒、1 回目の起動で登録から約 1 時間後は +10 ms でした。1 秒より細かい網時刻が入るのか、入るならいつかは分かっていません (`docs/at-commands.md`)
-  - LTE 経由の NTP (IIJmio、`wwan0` へのホスト経路) は動いています。NICT までの往復は LAN 経由で約 10 ms、LTE 経由で約 62 ms、LTE 経由のずれは +8〜+16 ms (上りと下りの遅延の差によるもの) でした (2026-11-18、数回の測定)
 - `contrib/` の設定例は未検証です
 
 ## 必要なもの
@@ -56,7 +55,7 @@ ltentp --device /dev/wwan0at1 [--chrony-sock /run/chrony/ltentp-nitz.sock] [--cs
 - 存在しないオプションや重複指定はエラーで、終了コード 2 になります
 
 起動時には毎回 `AT+CTZR=3` を送り、`+CTZEU` の通知を有効にします。この機体のファームウェア (18601.5001.00.01.17.30) が `+CTZR: (0-3)` を返し、3 に対応していることは確認済みです。
-網を登録し直させて NITZ を強制的に送らせる操作 (`AT+CFUN`・`AT+COPS` など) はしません。LTE のデータ通信が切れ、LTE 経由 NTP の測定を乱すためです。
+網を登録し直させて NITZ を強制的に送らせる操作 (`AT+CFUN`・`AT+COPS` など) はしません。網から切断する操作は、実験として手で行います。
 
 デバイスと chrony のソケットに書き込むため、PoC の段階では root で実行する想定です。
 
@@ -93,29 +92,6 @@ NITZ の時刻は秒単位で切り捨てられているため、`offset_s` は 
   - chrony のソース (`refclock.c`・`samplefilt.c`) で確認したところ、参照クロックのフィルタは 1 回の poll にサンプルが 1 つあれば値を出します。NITZ がまれにしか届かなくても、既定の `filter` のままで chrony の統計に載ります
   - `log refclocks` は、受け取ったサンプルを受信のたびに記録します
 - `contrib/udev/77-ltentp-mm-ignore.rules`: `wwan0at1` を ModemManager に使わせない udev ルール
-
-## LTE 経由の NTP (実機で使った手順)
-
-ModemManager を使わず、libmbim-utils (`mbimcli`) でつなぎます。網への登録が済んでいる前提です。
-
-```sh
-systemd-run --unit=mbim-proxy-ltentp /usr/libexec/mbim-proxy --no-exit   # MBIM を開いたままにする
-mbimcli -d /dev/wwan0mbim0 -p --attach-packet-service
-mbimcli -d /dev/wwan0mbim0 -p --connect="session-id=0,access-string=iijmio.jp,ip-type=ipv4,auth=chap,username=mio@iij,password=iij"
-# 表示された IPv4 アドレスと MTU を設定する。既定経路と DNS は変えない
-ip addr add <address>/<prefix> dev wwan0
-ip link set wwan0 mtu <mtu> up
-sysctl -w net.ipv6.conf.wwan0.accept_ra=0   # IPv6 の既定経路が LTE に移らないように
-# 比べる NTP サーバーだけ wwan0 に向ける。wwan0 が落ちたときに LAN へ漏れないよう unreachable も足す
-ip route add 133.243.238.164/32 dev wwan0 src <address>
-ip route add unreachable 133.243.238.164/32 metric 4000
-# chrony には実行中だけ足す (再起動で経路と一緒に消える)
-chronyc add server 133.243.238.164 iburst noselect minpoll 6 maxpoll 6
-```
-
-- APN 等は IIJmio の公式の設定値です。`auth` は小文字 (`chap`) でないと `mbimcli` が受け付けません
-- 経路が LTE を通ることは `ip route get <サーバー>` と `/sys/class/net/wwan0/statistics/` の増加で確かめます
-- LTE 経由のサーバーを chrony の設定ファイルに書くと、再起動後は経路がないまま LAN 経由で測ってしまいます。比べる相手の LAN 経由のサーバー (同じ NICT の別アドレス) と `log measurements` は設定ファイルに書きます (`contrib/chrony/ltentp.conf`)
 
 ## ドキュメント
 
