@@ -1,7 +1,7 @@
 //! Calendar date-time as sent by the modem, and its conversion to Unix seconds.
 //!
 //! No time zone is applied here: the caller decides what the fields mean
-//! (see docs/at-commands.md for why `+CCLK` must not be shifted by its zone).
+//! (`+CTZEU` carries UTC; `+CCLK` carries local time, see `TimeLine::cclk_utc`).
 
 use std::fmt;
 

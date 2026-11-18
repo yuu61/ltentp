@@ -1,14 +1,19 @@
 //! Turns lines from the AT port into CSV rows and chrony samples.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 use crate::at::{TimeLine, parse_time_line};
 use crate::chrony::{Sample, SampleSink};
-use crate::clock::{Clock, Stamp};
-use crate::framing::LineSplitter;
+use crate::clock::Stamp;
+use crate::edge::Edge;
 
 pub const CSV_HEADER: &str =
     "mono_s,realtime_s,kind,tz_quarters,dst,remote_unix_s,offset_s,chrony,note,raw";
+
+/// A modem clock further than this from the system clock is taken as not set
+/// (after a reset the L860-GL counts from `70/01/01`); no offset is recorded.
+pub const UNSET_LIMIT_S: f64 = 86_400.0;
+const UNSET_NOTE: &str = "clock not set? (over a day from system time)";
 
 /// Writes one CSV row per line and forwards `+CTZEU` samples to chrony.
 #[derive(Debug)]
@@ -30,11 +35,13 @@ impl<W: Write> Recorder<W> {
 
     /// Records one line received at `stamp`. Every line is logged, including
     /// echoes, `OK` and lines that fail to parse, so the raw stream can be re-analysed.
+    /// Returns the line's parsed form when it is a well-formed time line.
     ///
     /// # Errors
     /// Fails if the CSV output cannot be written. A chrony send failure is only logged.
-    pub fn on_line(&mut self, line: &str, stamp: Stamp) -> io::Result<()> {
+    pub fn on_line(&mut self, line: &str, stamp: Stamp) -> io::Result<Option<TimeLine>> {
         let mut row = Row::new(stamp, line);
+        let mut parsed = None;
         match parse_time_line(line) {
             None => row.kind = "LINE",
             Some(Err(e)) => {
@@ -44,8 +51,30 @@ impl<W: Write> Recorder<W> {
             Some(Ok(t)) => {
                 row.kind = t.kind();
                 self.fill(&mut row, &t, stamp);
+                parsed = Some(t);
             }
         }
+        row.write(&mut self.out)?;
+        self.out.flush()?;
+        Ok(parsed)
+    }
+
+    /// Records a located tick of the modem clock (`CCLK_EDGE`), stamped at the
+    /// bracket's midpoint. Not sent to chrony.
+    ///
+    /// # Errors
+    /// Fails if the CSV output cannot be written.
+    pub fn on_edge(&mut self, edge: &Edge, tz_quarters: Option<i32>) -> io::Result<()> {
+        let mut row = Row::new(edge.mid(), "");
+        row.kind = "CCLK_EDGE";
+        row.tz = tz_quarters;
+        set_clock_offset(&mut row, edge.utc, edge.offset_s());
+        let width = format!("halfwidth_s={:.6}", edge.half_width_s());
+        row.note = if row.note.is_empty() {
+            width
+        } else {
+            format!("{} {width}", row.note)
+        };
         row.write(&mut self.out)?;
         self.out.flush()
     }
@@ -74,13 +103,14 @@ impl<W: Write> Recorder<W> {
                 row.dst = Some(dst);
             }
             TimeLine::Ctzv { tz_quarters } => row.tz = Some(tz_quarters),
-            TimeLine::Cclk { time, tz_quarters } => {
-                // The time field is read as UTC without applying the zone
-                // (observed behaviour of the L860-GL; see docs/at-commands.md).
-                // Not sent to chrony: its meaning is not confirmed.
+            TimeLine::Cclk { tz_quarters, .. } => {
+                // Local time minus the zone (TS 27.007; docs/at-commands.md).
+                // Not sent to chrony: one-second resolution, and its source
+                // (NITZ or something finer) is not known.
                 row.tz = tz_quarters;
-                row.remote = Some(time.unix_seconds());
-                row.offset = Some(Sample::from_reference(time.unix_seconds(), stamp).offset_s);
+                if let Some(utc) = t.cclk_utc() {
+                    set_clock_offset(row, utc, Sample::from_reference(utc, stamp).offset_s);
+                }
             }
         }
     }
@@ -95,32 +125,6 @@ impl<W: Write> Recorder<W> {
                 eprintln!("ltentp: chrony send failed: {e}");
                 format!("error: {e}")
             }
-        }
-    }
-}
-
-/// Reads the port until EOF, stamping each read as soon as it returns.
-///
-/// # Errors
-/// Returns read errors (other than `Interrupted`) and CSV write errors.
-pub fn run<R: Read, C: Clock, W: Write>(
-    reader: &mut R,
-    clock: &mut C,
-    recorder: &mut Recorder<W>,
-) -> io::Result<()> {
-    let mut splitter = LineSplitter::new();
-    let mut buf = [0u8; 1024];
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        // Stamp before any parsing; every line completed by this read shares it.
-        let stamp = clock.now();
-        for line in splitter.push(&buf[..n]) {
-            recorder.on_line(&line, stamp)?;
         }
     }
 }
@@ -171,6 +175,16 @@ impl Row {
     }
 }
 
+/// Fills the modem clock and its offset, or flags a clock that was never set.
+fn set_clock_offset(row: &mut Row, utc: i64, offset_s: f64) {
+    row.remote = Some(utc);
+    if offset_s.abs() > UNSET_LIMIT_S {
+        UNSET_NOTE.clone_into(&mut row.note);
+    } else {
+        row.offset = Some(offset_s);
+    }
+}
+
 fn format_realtime(ns: i128) -> String {
     let sec = ns.div_euclid(1_000_000_000);
     let frac = ns.rem_euclid(1_000_000_000);
@@ -189,7 +203,10 @@ fn csv_field(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Clock;
+    use crate::session::{Session, run};
     use std::cell::RefCell;
+    use std::io::Read;
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -213,6 +230,7 @@ mod tests {
     }
 
     /// Returns 1794905484.250 s, then +1 s per call.
+    #[derive(Clone)]
     struct FakeClock(i128);
 
     impl Clock for FakeClock {
@@ -240,11 +258,14 @@ mod tests {
         }
     }
 
+    /// Runs the real read loop (reader thread included) over `chunks`.
     fn run_chunks(chunks: Vec<&'static [u8]>, sink: Option<Box<dyn SampleSink>>) -> String {
         let mut out = Vec::new();
         let mut rec = Recorder::new(&mut out, sink);
         rec.write_header().unwrap();
-        run(&mut Chunks(chunks), &mut FakeClock(0), &mut rec).unwrap();
+        let mut session = Session::new(rec, None, io::sink());
+        run(Chunks(chunks), FakeClock(0), &mut session).unwrap();
+        drop(session);
         String::from_utf8(out).unwrap()
     }
 
@@ -279,17 +300,41 @@ mod tests {
     }
 
     #[test]
-    fn cclk_is_logged_but_not_sent() {
+    fn cclk_is_local_time_and_not_sent() {
         let samples = Rc::new(RefCell::new(Vec::new()));
+        // 17:51:24 JST (+36 quarters) is 08:51:24 UTC.
         let csv = run_chunks(
-            vec![b"+CCLK: \"26/11/17,08:51:24+36\"\r\n\r\nOK\r\n"],
+            vec![b"+CCLK: \"26/11/17,17:51:24+36\"\r\n\r\nOK\r\n"],
             Some(Box::new(Capture(samples.clone()))),
         );
-        assert!(csv.contains(
-            "0.000000,1794905484.250000000,CCLK,36,,1794905484,-0.250000000,,,\
-             \"+CCLK: \"\"26/11/17,08:51:24+36\"\"\""
-        ));
+        assert!(
+            csv.contains(
+                "0.000000,1794905484.250000000,CCLK,36,,1794905484,-0.250000000,,,\
+                 \"+CCLK: \"\"26/11/17,17:51:24+36\"\"\""
+            ),
+            "{csv}"
+        );
         assert_eq!(samples.borrow().len(), 0);
+    }
+
+    #[test]
+    fn cclk_zone_west_of_utc() {
+        // 00:51:24 at -8 h (-32 quarters) is 08:51:24 UTC.
+        let csv = run_chunks(vec![b"+CCLK: \"26/11/17,00:51:24-32\"\r\n"], None);
+        assert!(
+            csv.contains(",CCLK,-32,,1794905484,-0.250000000,,,"),
+            "{csv}"
+        );
+    }
+
+    #[test]
+    fn unset_clock_is_flagged_without_offset() {
+        // After a reset the modem counts from 70/01/01, read as 2070.
+        let csv = run_chunks(vec![b"+CCLK: \"70/01/01,01:03:22+00\"\r\n"], None);
+        assert!(
+            csv.contains(&format!(",CCLK,0,,3155763802,,,{UNSET_NOTE},")),
+            "{csv}"
+        );
     }
 
     #[test]

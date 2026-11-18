@@ -16,8 +16,8 @@ pub trait Clock {
     fn now(&mut self) -> Stamp;
 }
 
-/// The real clocks.
-#[derive(Debug)]
+/// The real clocks. Clones share the monotonic origin.
+#[derive(Debug, Clone)]
 pub struct SystemClock {
     start: Instant,
 }

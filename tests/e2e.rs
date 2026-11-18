@@ -67,13 +67,16 @@ fn ctzeu_reaches_csv_and_chrony_socket() {
 
     let mut buf = [0u8; 64];
     let received = chronyd.recv(&mut buf);
-    // Let the CSV row land (it is written before the send, but be safe), then stop.
+    // Wait for every expected row to be complete before stopping ltentp. The
+    // echo of its own AT+CTZR=3 may reach the FIFO before or after the modem
+    // lines, so its row can be the last one written.
+    let complete = |text: &str| {
+        text.contains(",LINE,,,,,,,AT+CTZR=3\n")
+            && text.contains(",LINE,,,,,,,OK\n")
+            && text.contains("\"+CTZEU: +36,0,\"\"2026/11/17,08:51:24\"\"\"\n")
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline
-        && !fs::read_to_string(&csv)
-            .unwrap_or_default()
-            .contains("CTZEU")
-    {
+    while Instant::now() < deadline && !complete(&fs::read_to_string(&csv).unwrap_or_default()) {
         std::thread::sleep(Duration::from_millis(20));
     }
     child.kill().unwrap();

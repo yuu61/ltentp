@@ -4,6 +4,13 @@ LTE の網時刻 (NITZ) を時刻源として評価する PoC。Rust、Linux 専
 
 ## Commands
 
+Linux (WSL 内で直接、または実機) では:
+
+```sh
+bash scripts/check.sh   # fmt --check / clippy -D warnings (pedantic) / test (ユニット + tests/e2e.rs)
+cargo fmt
+```
+
 Windows から実行する場合は WSL の Debian を使う (Windows ではビルドできない):
 
 ```powershell
@@ -18,7 +25,7 @@ wsl -d Debian --cd /mnt/c/repository/ltentp --exec bash -l -c 'cargo fmt'
 - 上のコマンドは PowerShell 用。Git Bash から実行すると `/mnt/c/...` が Windows のパスに書き換えられて失敗する (`MSYS_NO_PATHCONV=1` を付ける)
 - 終了コードは `$LASTEXITCODE` で取れる (確認済み)
 - ビルド出力は `CARGO_TARGET_DIR=$HOME/.cache/ltentp-target` (WSL 側)。`/mnt/c` は遅いため
-- WSL には python3・socat・chrony は入っていない。入れる前にユーザーに確認する
+- パッケージを入れる前にユーザーに確認する (開発環境・実機とも)
 
 ## Architecture
 
@@ -27,8 +34,10 @@ wsl -d Debian --cd /mnt/c/repository/ltentp --exec bash -l -c 'cargo fmt'
 - `src/civil.rs`: 日時と Unix 秒の変換 (ゾーンは適用しない)
 - `src/clock.rs`: read 直後の時刻 (システム時刻 + 単調時間)。テストでは差し替える
 - `src/chrony.rs`: `struct sock_sample` (40 バイト) の組み立てと送信
-- `src/recorder.rs`: 行 → CSV と chrony 送信、読み込みループ `run`
-- `src/cli.rs` / `src/main.rs`: オプション解析と起動 (`AT+CTZR=3` 送信、`AT+CCLK?` の定期送信)
+- `src/recorder.rs`: 行 → CSV と chrony 送信、`CCLK_EDGE` 行
+- `src/edge.rs`: `AT+CCLK?` の秒の切り替わりの検出 (`EdgeDetector`) と問い合わせの予定 (`CclkPoller`)。時刻は引数で受け取る純粋なロジック
+- `src/session.rs`: 読み込みスレッド (read 直後に時刻を取る) とメインループ `run` (行の処理、`AT+CCLK?` の送信)
+- `src/cli.rs` / `src/main.rs`: オプション解析と起動 (`AT+CTZR=3` 送信)
 
 ## Conventions
 
@@ -36,7 +45,8 @@ wsl -d Debian --cd /mnt/c/repository/ltentp --exec bash -l -c 'cargo fmt'
 - `unsafe` 禁止 (`Cargo.toml` の `[lints]`)。clippy pedantic を警告なしで通す
 - 受信した行はすべて CSV に残す。解析に失敗しても止めない
 - chrony の offset は「真の時刻 − システム時刻」。符号を変える変更ではテストで両方の符号を確認する
-- `+CCLK` はゾーンを適用せず、chrony にも送らない (docs/at-commands.md)
+- `+CCLK` の時刻欄は現地時刻としてゾーンを引く (TS 27.007、Linux の実機で確認)。Windows では UTC に見えたことがあり原因不明 (docs/at-commands.md)。`CCLK`・`CCLK_EDGE` は chrony に送らない
+- `--cclk-interval` の間、ltentp のポートに他のプロセスから書き込まない (問い合わせと応答の対応が崩れる)。手動の AT は別のポートで送る
 - `AT+CFUN`・`AT+COPS` など網から切断する操作を既定で行わない
 - コードのコメントは英語、ドキュメントは日本語
 - AT の仕様を足すときは docs/at-commands.md も更新する。Fibocom のマニュアルは転載禁止なので要約して節とページを書く
